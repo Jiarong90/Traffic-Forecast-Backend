@@ -490,7 +490,7 @@ async def poll_incidents():
 
                 best_match = None
                 for inc in tracked_incidents:
-                    dist = sqrt((s_lat - inc['lat'])**2 + (s_lon - inc['lon'])**2)
+                    dist = math.sqrt((s_lat - inc['lat'])**2 + (s_lon - inc['lon'])**2)
                     if dist < 0.002: 
                         best_match = inc
                         break
@@ -2672,18 +2672,23 @@ def predict_incident_ml(body: IncidentPredictRequest):
 # Incident impact part
 
 # Helper function to calculate incident impact
+# Starting from incident's matched road link, walk upstream to nearby links
+# includes links that are currently slow enough to look affected by the disruption.
 def calculate_live_impact_zone(start_link_id, live_speedbands, road_meta_dict, upstream_map, incident_age_mins):
+    # Get recent speedband history
     start_history = live_speedbands.get(int(start_link_id), [])
     if not start_history:
         print(f"DEBUG: No speedband history found for {start_link_id}")
         return {"segments": []} 
     current_sb_start = start_history[0] if start_history else 6
     
-
+    # If the incident link is flowing normally, assume there is no congestion
     if current_sb_start >= 5:
         return {"coords": [], "road_names": []}
 
+    # Track all links current affected
     impacted_links = {int(start_link_id)}
+    # BFS search queue
     queue = [(int(start_link_id), 0)]
     # Search depth
     max_depth = 15
@@ -2693,11 +2698,13 @@ def calculate_live_impact_zone(start_link_id, live_speedbands, road_meta_dict, u
         if depth >= max_depth:
             continue
 
+        # Get upstream neighbors for current link
         neighbors = upstream_map.get(str(curr_link), [])
         
         for n_link_str in neighbors:
             n_link = int(n_link_str)
             
+            # Skip links already labelled as impacted
             if n_link not in impacted_links:
                 history = live_speedbands.get(n_link, [])
                 if not history: 
@@ -2705,6 +2712,8 @@ def calculate_live_impact_zone(start_link_id, live_speedbands, road_meta_dict, u
                 
                 current_sb = history[0] 
 
+                # For newer incidents, we use a looser threshold
+                
                 if incident_age_mins < 15:
       
                     past_sb = history[3] if len(history) > 3 else 6
