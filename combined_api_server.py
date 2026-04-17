@@ -9,6 +9,7 @@ import traceback
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+import uuid
 
 import duckdb
 import httpx
@@ -51,6 +52,10 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",
 
 # External URLs
 ONEMAP_SEARCH_URL = "https://www.onemap.gov.sg/api/common/elastic/search"
+RAINFALL_URL = "https://api-open.data.gov.sg/v2/real-time/api/rainfall"
+weather_headers = {"accept": "application/json"}
+if DATA_GOV_API_KEY:
+    weather_headers["X-API-Key"] = DATA_GOV_API_KEY
 
 # Paths
 PLAN_MODEL_PATH = "data/plan_model.parquet"
@@ -142,11 +147,21 @@ def load_upstream_map() -> dict:
     print(f"Loaded {len(result)} upstream connections into memory.")
     return result
 
+def load_hotspots_lookup():
+    df = pd.read_parquet("data/link_level_hotspots.parquet")
+    
+    # Only keep links with a danger_score >= 3.0 
+    high_risk_df = df[df["danger_score"] >= 3.0].copy()
+    
+    return high_risk_df.set_index("nearest_link_id").to_dict("index")
+
 # Global Data / Load Models
 # Store the precomputed T+15 speedbands for all 150k links
 GLOBAL_T15_CACHE = {}
 current_rain_mm = 0
+latest_rainfall_map = {}
 live_speedbands = defaultdict(list)
+active_replay_recordings = {}
 
 models = load_xgb_models()
 road_links_df = load_road_links()
@@ -154,9 +169,10 @@ neighbor_map = load_neighbor_map()
 weather_map = load_weather_map()
 hotspots_cache = load_hotspots_cache()
 upstream_map = load_upstream_map()
+hotspot_map = load_hotspots_lookup()
 
 road_meta_dict = road_links_df.set_index("link_id")[
-    ["start_lat", "start_lon", "end_lat", "end_lon", "road_name", "road_category"]
+    ["start_lat", "start_lon", "end_lat", "end_lon", "mid_lat", "mid_lon", "road_name", "road_category"]
 ].to_dict("index")
 
 road_category_dict = road_links_df.set_index("link_id")["road_category"].to_dict()
@@ -277,6 +293,17 @@ class IncidentPredictRequest(BaseModel):
     lat: Optional[float] = None 
     lon: Optional[float] = None
 
+# Admin Record Classes
+class ReplayStartRequest(BaseModel):
+    route_id: Optional[int] = None
+    route_name: str
+    link_ids: List[int]
+
+class ReplayStopRequest(BaseModel):
+    route_name: str
+
+class RouteIntelRequest(BaseModel):
+    link_ids: List[int]
 
 
 _incident_classifier = None
@@ -371,6 +398,11 @@ async def lightweight_poller():
                         break
 
             print(f"Updated cache for {len(live_speedbands)} roads.")
+
+            try:
+                refresh_latest_rainfall()
+            except Exception as rain_err:
+                print(f"Error refreshing rainfall: {rain_err}")
 
             try:
                 await precompute_global_t15()
@@ -598,7 +630,7 @@ def find_nearest_link_id(inc_lat, inc_lon, message=""):
     best = top[0]
     return best[1], (best[2] or "LTA Road")
 
-def assemble_features(link_id, rain_mm, active_incidents):
+def assemble_features(link_id, active_incidents):
 
     # Get history and immediately apply the padding fix
     vals = live_speedbands.get(link_id, [6, 6, 6, 6]) 
@@ -624,6 +656,8 @@ def assemble_features(link_id, rain_mm, active_incidents):
     has_roadwork = 0
     has_breakdown = 0
     start_times = []
+
+    rain_mm = get_link_rainfall(link_id)
     
     # Loop through nearby links to find incidents and their types
     for l in nearby_links:
@@ -642,7 +676,6 @@ def assemble_features(link_id, rain_mm, active_incidents):
         delta = datetime.now() - earliest_start
         mins_since = delta.total_seconds() / 60.0
 
-    # 4. Construct the row in exact order
     feature_row = {
         "sb": sb,
         "sb_tm5": sb5,
@@ -669,15 +702,17 @@ def assemble_features(link_id, rain_mm, active_incidents):
     
     return pd.DataFrame([feature_row])
 
-def build_master_feature_dataframe(current_rain_mm, active_incidents):
+def build_master_feature_dataframe(active_incidents):
     all_rows = []
     now = datetime.now()
     
     is_weekend = 1 if now.weekday() >= 5 else 0
     is_peak = 1 if now.hour in [7, 8, 9, 17, 18, 19] else 0
-    is_raining = 1 if current_rain_mm > 0 else 0
 
     for link_id, meta in road_meta_dict.items():
+
+        rain_mm = get_link_rainfall(link_id)
+        is_raining = 1 if rain_mm > 0 else 0
 
         vals = live_speedbands.get(link_id, [6, 6, 6, 6])
         if len(vals) < 4:
@@ -729,7 +764,7 @@ def build_master_feature_dataframe(current_rain_mm, active_incidents):
             "mid_lon": meta.get("mid_lon", 0),
             "acceleration": (sb - sb5) - (sb5 - sb10),
             "link_dist_proxy": meta.get("link_dist_proxy", 0),
-            "rain_mm": current_rain_mm,
+            "rain_mm": rain_mm,
             "is_raining": is_raining,
             "road_category": int(meta.get("road_category", 1)),
             "is_weekend": is_weekend,
@@ -745,7 +780,7 @@ def build_master_feature_dataframe(current_rain_mm, active_incidents):
 
 async def precompute_global_t15():
     global GLOBAL_T15_CACHE
-    all_features_df = build_master_feature_dataframe(current_rain_mm, active_incidents)
+    all_features_df = build_master_feature_dataframe(active_incidents)
 
     chunk_size = 10000
     temp_cache = {}
@@ -809,9 +844,56 @@ async def precompute_global_t15():
     GLOBAL_T15_CACHE = temp_cache
     print("Precomputed T+15 links")
 
-    
 
-        
+def get_rainfall_data():
+    response = requests.get(RAINFALL_URL, headers=weather_headers, timeout=30)
+    response.raise_for_status()
+    return response.json()
+    
+def refresh_latest_rainfall():
+    global latest_rainfall_map
+
+    data = get_rainfall_data() 
+    readings = data.get("data", {}).get("readings", [])
+
+    if not readings:
+        latest_rainfall_map = {}
+        return
+    
+    for row in readings[0]["data"]:
+        if row.get("value") is not None:
+            key = row["stationId"]
+            val = float(row["value"])
+            latest_rainfall_map[key] = val
+
+def get_link_rainfall(link_id: int) -> float:
+    station_id = weather_map.get(link_id)
+    if not station_id:
+        return 0.0
+    return latest_rainfall_map.get(station_id, 0.0)
+
+# To record routes
+# def append_replay_snapshot():
+#     now = datetime.now().isoformat()
+
+#     for rec in active_replay_recordings.values():
+#         snapshot = {
+#             "timestamp": now,
+#             "segments": []
+#         }
+
+#         for link_id in rec["link_ids"]:
+#             feats_df = assemble_features(link_id, active_incidents)
+#             feature_row = feats_df.iloc[0].to_dict()
+
+#             pred = GLOBAL_T15_CACHE.get(link_id, {})
+
+#             snapshot["segments"].append({
+#                 "link_id": int(link_id),
+#                 "features": {
+#                     k: 
+#                 }
+#             })
 
 
 app = FastAPI(title="FAST Compute API", version="1.0.0")
@@ -2507,8 +2589,6 @@ def get_dashboard_hotspots():
 
 
 # Muhsin incident clearance part
-
-
 def _load_incident_models():
     global _incident_classifier, _incident_regressor, _incident_encoder
     if _incident_classifier is not None:
@@ -2713,7 +2793,7 @@ def calculate_live_impact_zone(start_link_id, live_speedbands, road_meta_dict, u
                 current_sb = history[0] 
 
                 # For newer incidents, we use a looser threshold
-                
+
                 if incident_age_mins < 15:
       
                     past_sb = history[3] if len(history) > 3 else 6
@@ -2741,3 +2821,76 @@ def calculate_live_impact_zone(start_link_id, live_speedbands, road_meta_dict, u
             impact_segments.append(segment)
 
     return {"segments": impact_segments}
+
+
+# ADMIN RECORD and REPLAY endpoints for routes
+@app.post("/api/replay/start")
+def start_replay_recording(req: ReplayStartRequest):
+    recording_id = f"rec_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+
+    active_replay_recordings[recording_id] = {
+        "recording_id": recording_id,
+        "route_id": req.route_id,
+        "route_name": req.route_name,
+        "link_ids": req.link_ids,
+        "started_at": datetime.now(),
+        "snapshots": []
+    }
+
+    return {
+        "ok": True,
+        "recording_id": recording_id,
+        "route_name": req.route_name
+    }
+
+@app.post("/api/replay/stop")
+def stop_replay_recording(req: ReplayStopRequest):
+    active_replay_recordings.pop(req.route_name, None)
+    return {"ok": True, "message": f"Recording stopped for {req.route_name}"}
+
+@app.post("/api/route-intel")
+async def get_route_intel(data: RouteIntelRequest):
+    link_ids = data.link_ids
+
+    summary = {
+        "total_hotspots": 0,
+        "total_incidents": 0,
+        "is_raining_anywhere": False,
+        "highest_danger_score": 0.0
+    }
+
+    # Per segment Intel 
+    details = {}
+
+    for lid in link_ids:
+        hotspot = hotspot_map.get(lid) or hotspot_map.get(str(lid))
+
+        incident = active_incidents.get(lid)
+
+        station_id = weather_map.get(lid)
+        rain_val = latest_rainfall_map.get(station_id, 0.0)
+        is_raining = rain_val > 0
+
+        # Populate Details if needed
+        if hotspot or incident or is_raining:
+            details[lid] = {
+                "is_hotspot": bool(hotspot),
+                "danger_score": hotspot["danger_score"] if hotspot else 0,
+                "incident_type": incident["type"] if incident else None,
+                "is_raining": is_raining,
+                "rain_mm": rain_val
+            }
+
+            if hotspot: 
+                summary["total_hotspots"] += 1
+                summary["highest_danger_score"] = max(summary["highest_danger_score"], hotspot["danger_score"])
+            if incident: 
+                summary["total_incidents"] += 1
+            if is_raining: 
+                summary["is_raining_anywhere"] = True
+
+    return {
+        "summary": summary,
+        "details": details
+    }
+
