@@ -744,7 +744,9 @@ def recalculate_route(payload):
     start = {"lat": start_lat, "lon": start_lon}
     end = {"lat": end_lat, "lon": end_lon}
 
-    nodes = build_graph_recalc(roads)
+
+    road_meta = payload.get("road_meta") or {}
+    nodes = build_graph_recalc(roads, road_meta)
     if not nodes:
         return {"routes": []}
 
@@ -757,10 +759,10 @@ def recalculate_route(payload):
     preference = payload.get("preference", "fastest")
     modes = [
         {"id": "fastest", "label": "FASTEST", "color": "#2563eb", "desc": "Prioritize total time"},
-        {"id": "fewerLights", "label": "FEWER LIGHTS", "color": "#16a34a", "desc": "Reduce intersection waiting"},
-        {"id": "balanced", "label": "BALANCED", "color": "#ea580c", "desc": "Near-fastest with fewer lights"},
-        {"id": "fastest2", "label": "ALTERNATE A", "color": "#8b5cf6", "desc": "Diversified"},
-        {"id": "fastest3", "label": "ALTERNATE B", "color": "#06b6d4", "desc": "Diversified"},
+        # {"id": "fewerLights", "label": "FEWER LIGHTS", "color": "#16a34a", "desc": "Reduce intersection waiting"},
+        # {"id": "balanced", "label": "BALANCED", "color": "#ea580c", "desc": "Near-fastest with fewer lights"},
+        # {"id": "fastest2", "label": "ALTERNATE A", "color": "#8b5cf6", "desc": "Diversified"},
+        # {"id": "fastest3", "label": "ALTERNATE B", "color": "#06b6d4", "desc": "Diversified"},
     ]
 
     # Get the 'user's preference' from settings. Default fastest for now
@@ -779,7 +781,7 @@ def recalculate_route(payload):
             
 
             # Load road_meta from passed parameters to map to LTA road link
-            road_meta = payload.get("road_meta") or {}
+            # road_meta = payload.get("road_meta") or {}
             base = edge["weight"]
 
             # Get the T+15 Speedbands cache to perform calculations using T+15 as heuristic
@@ -787,8 +789,8 @@ def recalculate_route(payload):
             speed_kmh = 40.0
             t15_cache = payload.get("t15_cache", {})
 
-
-            link_id = find_link_id_from_meta(to_node["lat"], to_node["lon"], road_meta)
+            link_id = edge.get("link_id")
+            # link_id = find_link_id_from_meta(to_node["lat"], to_node["lon"], road_meta)
             if link_id:
                 link_id_int = int(link_id)
                 if link_id_int in t15_cache:
@@ -879,7 +881,7 @@ def find_link_id_from_meta(lat, lon, road_meta):
     return str(best_id) if best_id else None
 
 
-def build_graph_recalc(roads):
+def build_graph_recalc(roads, road_meta):
     nodes: Dict[str, Dict] = {}
 
     def ensure(lat, lon):
@@ -921,13 +923,18 @@ def build_graph_recalc(roads):
 
             base_hours = (dist_m / 1000.0) / 40.0
 
+            mid_lat = (a_lat + b_lat) / 2.0
+            mid_lon = (a_lon + b_lon) / 2.0
+
+            edge_link_id = find_link_id_from_meta(mid_lat, mid_lon, road_meta)
+
             if oneway in ("yes", "1", "true"):
-                n1["edges"].append({"to": n2["key"], "weight": base_hours})
+                n1["edges"].append({"to": n2["key"], "weight": base_hours, "link_id": edge_link_id})
             elif oneway == "-1":
-                n2["edges"].append({"to": n1["key"], "weight": base_hours})
+                n2["edges"].append({"to": n1["key"], "weight": base_hours, "link_id": edge_link_id})
             else:
-                n1["edges"].append({"to": n2["key"], "weight": base_hours})
-                n2["edges"].append({"to": n1["key"], "weight": base_hours})
+                n1["edges"].append({"to": n2["key"], "weight": base_hours, "link_id": edge_link_id})
+                n2["edges"].append({"to": n1["key"], "weight": base_hours, "link_id": edge_link_id})
 
             n1["degree"] += 1
             n2["degree"] += 1

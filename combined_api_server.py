@@ -1778,6 +1778,14 @@ def analyze_habit_route(payload: dict[str, Any],
     if not coords or not isinstance(coords, list) or len(coords) < 2:
         raise HTTPException(status_code=400, detail="coords_json must contain 2 coordinates")
     try:
+
+        total_physical_distance_m = 0
+        for i in range(len(coords)- 1):
+            p1 = coords[i]
+            p2 = coords[i+1]
+            total_physical_distance_m += approx_meters(p1[0], p1[1], p2[0], p2[1])
+
+
         match_info = match_route_to_lta_links(coords)
         # Get all link_ids 
         links = match_info["matched_links"]
@@ -1805,11 +1813,14 @@ def analyze_habit_route(payload: dict[str, Any],
         worst_link = None
         status = "Stable"
 
+        total_matched_dist_m = 0
         for link in links:
             dist = link["segment_len_m"]
             pred = link.get("prediction")
             if not pred:
                 continue
+
+            total_matched_dist_m += dist
 
             curr_sb = pred["current_val"]
             pred_sb = pred["predicted_val"]
@@ -1850,6 +1861,12 @@ def analyze_habit_route(payload: dict[str, Any],
         delay = predicted_eta - curr_eta
         if delay > 1:
             status = "Slowing down"
+
+        missing_dist_m = max(0, total_physical_distance_m - total_matched_dist_m)
+        missing_time_mins = (missing_dist_m / 1000) / 40 * 60
+        print(missing_dist_m)
+        curr_eta += missing_time_mins
+        predicted_eta += missing_time_mins
         
         summary = {
             "curr_eta": round(curr_eta, 1),
@@ -2074,7 +2091,6 @@ async def find_best_time(req: BestTimeRequest):
 
     pivot = df.pivot(index="time_bucket", columns="link_id", values="typical_sb").to_dict("index")
 
-    # 2. Revert to YOUR Original Math (Fixes the "No times found" bug)
     total_segments = len(req.segment_sequence)
     avg_segment_km = (req.distance_m / total_segments / 1000.0) if total_segments > 0 else 0.5
 
@@ -2090,7 +2106,6 @@ async def find_best_time(req: BestTimeRequest):
                     band = link_data[l_id]
                     speed = BAND_TO_KMH.get(band, 45)
 
-            # Your original proportional math
             total_eta += (avg_segment_km / speed) * 60.0
 
         real_sgt_bucket = bucket
@@ -2413,16 +2428,21 @@ def fetch_roads_from_overpass(s, w, n, e):
     except Exception as e:
         return {"elements": []}, f"Invalid Overpass JSON: {e}"
 
+
+STRICT_HIGHWAYS = {
+    'motorway', 'trunk', 'primary', 'secondary', 'tertiary',
+    'motorway_link', 'trunk_link', 'primary_link', 'secondary_link', 'tertiary_link'
+}
+
 @app.post("/api/recalculate")
 async def handle_recalculate(request: RerouteRequest):
-
 
     try:
         payload = request.dict()
 
         start = payload["start"]
         end = payload["end"]
-        padding = 0.005
+        padding = 0.003
         s = min(start["lat"], end["lat"]) - padding
         n = max(start["lat"], end["lat"]) + padding
         w = min(start["lon"], end["lon"]) - padding
@@ -2436,9 +2456,19 @@ async def handle_recalculate(request: RerouteRequest):
         }
         payload["road_meta"] = local_meta
 
-        roads_json = subset_roads_by_bbox(LOCAL_ROADS_JSON, s, w, n, e, margin_deg=0.015)
+        roads_json = subset_roads_by_bbox(LOCAL_ROADS_JSON, s, w, n, e, margin_deg=0.001)
         print("Local subset elements:" ,len(roads_json.get("elements", [])), flush=True)
 
+        if "elements" in roads_json and len(roads_json["elements"]) > 0:
+            print(f"DEBUG: First element keys: {roads_json['elements'][0].keys()}", flush=True)
+            print(f"DEBUG: First element sample: {roads_json['elements'][0]}", flush=True)
+        if "elements" in roads_json:
+            initial_count = len(roads_json["elements"])
+            roads_json["elements"] = [
+                e for e in roads_json["elements"]
+                if e.get("tags", {}).get("highway") in STRICT_HIGHWAYS
+            ]
+            print(f"filtered elements: {initial_count} -> {len(roads_json['elements'])}", flush=True)
         payload["roads"] = roads_json
         payload["t15_cache"] = GLOBAL_T15_CACHE
 
@@ -2454,18 +2484,18 @@ async def handle_recalculate(request: RerouteRequest):
         candidates = result.get("routes", [])
         if not candidates:
             print("Local subset found no route, falling back to Overpass", flush=True)
+            return {"routes": [], "error": "No alternate roads available"}
+            # roads_json, overpass_error = fetch_roads_from_overpass(s, w, n, e)
+            # if overpass_error:
+            #     return {"routes": [], "error": overpass_error}
 
-            roads_json, overpass_error = fetch_roads_from_overpass(s, w, n, e)
-            if overpass_error:
-                return {"routes": [], "error": overpass_error}
-
-            payload["roads"] = roads_json
-            print("B2: before fallback recalculate_route", flush=True)
-            result = recalculate_route(payload)
-            print("C2 after fallback", flush=True)
-            candidates = result.get("routes", [])
-            if not isinstance(result, dict):
-                return {"routes": [], "error": "recalculate_route returned invalid result after fallback"}        
+            # payload["roads"] = roads_json
+            # print("B2: before fallback recalculate_route", flush=True)
+            # result = recalculate_route(payload)
+            # print("C2 after fallback", flush=True)
+            # candidates = result.get("routes", [])
+            # if not isinstance(result, dict):
+            #     return {"routes": [], "error": "recalculate_route returned invalid result after fallback"}        
             
 
         if not isinstance(candidates, list):
