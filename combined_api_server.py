@@ -136,6 +136,14 @@ def load_hotspots_cache() -> list[dict]:
     gc.collect()
     return result
 
+def load_map_hotspots_cache() -> list[dict]:
+    df = pd.read_parquet("data/link_level_hotspots.parquet")
+    top_100 = df.head(100).copy()
+    result = top_100.to_dict(orient="records")
+    del df
+    gc.collect()
+    return result
+
 def load_upstream_map() -> dict:
     path = "data/upstream_neighbors.json"
     if not os.path.exists(path):
@@ -148,12 +156,14 @@ def load_upstream_map() -> dict:
     return result
 
 def load_hotspots_lookup():
-    df = pd.read_parquet("data/link_level_hotspots.parquet")
+    try:
+        df = pd.read_parquet("data/link_danger_lookup.parquet")
+        # Convert to dictionary for O(1) instant lookup
+        return df.set_index("nearest_link_id")["danger_score"].to_dict()
+    except Exception as e:
+        print(f"Routing lookup failed: {e}")
+        return {}
     
-    # Only keep links with a danger_score >= 3.0 
-    high_risk_df = df[df["danger_score"] >= 3.0].copy()
-    
-    return high_risk_df.set_index("nearest_link_id").to_dict("index")
 
 # Global Data / Load Models
 # Store the precomputed T+15 speedbands for all 150k links
@@ -168,8 +178,9 @@ road_links_df = load_road_links()
 neighbor_map = load_neighbor_map()
 weather_map = load_weather_map()
 hotspots_cache = load_hotspots_cache()
+map_hotspots_cache = load_map_hotspots_cache()
 upstream_map = load_upstream_map()
-hotspot_map = load_hotspots_lookup()
+link_danger_lookup = load_hotspots_lookup()
 
 road_meta_dict = road_links_df.set_index("link_id")[
     ["start_lat", "start_lon", "end_lat", "end_lon", "mid_lat", "mid_lon", "road_name", "road_category"]
@@ -2007,12 +2018,14 @@ async def get_historical_plan(req: HistoricalPlanRequest):
                 
 
                 # Calculate ETA 
-                dist_m = 500.0 
+                # dist_m = 500.0 
                 speed_kmh = BAND_TO_KMH.get(band, 45)
                 
                 # (Dist in km / Speed in kmh) * 60 minutes
-                travel_time = (dist_m / 1000.0) / speed_kmh * 60.0
-                predicted_eta_mins += travel_time
+                # travel_time = (dist_m / 1000.0) / speed_kmh * 60.0
+                # predicted_eta_mins += travel_time
+                
+
                 
                 if band <= 3: total_delay_mins += 0.2
                 elif band <= 5: total_delay_mins += 0.05
@@ -2033,10 +2046,13 @@ async def get_historical_plan(req: HistoricalPlanRequest):
                 segment_matches.append(None)
 
         # Realistic Base ETA Math
-        final_eta = round(predicted_eta_mins, 1)
 
-        avg_band = df['typical_sb'].mean() if not df.empty else 8
+        avg_band = df['typical_sb'].mean() if not df.empty else 6
+        avg_speed_kmh = BAND_TO_KMH.get(round(avg_band), 45)
+        final_eta = round(((req.distance_m / 1000.0) / avg_speed_kmh) * 60.0, 1)
+
         status = "Free Flow" if avg_band > 5 else ("Moderate" if avg_band > 3 else "Congested")
+
 
         return {
             "summary": {
@@ -2617,6 +2633,13 @@ def get_dashboard_hotspots():
         "data": hotspots_cache
     }
 
+# For Incident Hotspots on Map
+@app.get("/api/map-hotspots")
+def get_map_hotspots():
+    return {
+        "status": "success",
+        "data": map_hotspots_cache
+    }
 
 # Muhsin incident clearance part
 def _load_incident_models():
@@ -2893,7 +2916,9 @@ async def get_route_intel(data: RouteIntelRequest):
     details = {}
 
     for lid in link_ids:
-        hotspot = hotspot_map.get(lid) or hotspot_map.get(str(lid))
+        raw_score = link_danger_lookup.get(lid) or link_danger_lookup.get(str(lid), 0.0)
+
+        is_hotspot = raw_score > 0
 
         incident = active_incidents.get(lid)
 
@@ -2902,18 +2927,16 @@ async def get_route_intel(data: RouteIntelRequest):
         is_raining = rain_val > 0
 
         # Populate Details if needed
-        if hotspot or incident or is_raining:
+        if is_hotspot or incident or is_raining:
             details[lid] = {
-                "is_hotspot": bool(hotspot),
-                "danger_score": hotspot["danger_score"] if hotspot else 0,
+                "is_hotspot": is_hotspot,
                 "incident_type": incident["type"] if incident else None,
                 "is_raining": is_raining,
                 "rain_mm": rain_val
             }
 
-            if hotspot: 
+            if is_hotspot: 
                 summary["total_hotspots"] += 1
-                summary["highest_danger_score"] = max(summary["highest_danger_score"], hotspot["danger_score"])
             if incident: 
                 summary["total_incidents"] += 1
             if is_raining: 
