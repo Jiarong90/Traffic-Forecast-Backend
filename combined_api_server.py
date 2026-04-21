@@ -316,6 +316,18 @@ class ReplayStopRequest(BaseModel):
 class RouteIntelRequest(BaseModel):
     link_ids: List[int]
 
+class FeedbackIn(BaseModel):
+    location: Optional[str] = None
+    condition_type: Optional[str] = None
+    severity: Optional[str] = "MEDIUM"
+    comment: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    user_id: Optional[str] = None  # Injected by Node.js server.js
+
+class FeedbackRequest(BaseModel):
+    payload: FeedbackIn
+
 
 _incident_classifier = None
 _incident_regressor  = None
@@ -1214,6 +1226,65 @@ def delete_saved_place(
         raise HTTPException(status_code=500, detail=f"Delete failed: {r.text}")
 
     return {"deleted": True}
+
+
+# For feedback in Incident Panel
+@app.post("/api/feedback/list")
+def get_incident_feedback(data: FeedbackIn, authorization: str | None = Header(default=None)):
+    user = require_user(authorization) # Ensure we are authenticated!
+
+    params = {
+        "select": "*",
+        "order": "created_at.desc",
+        "limit": 10
+    }
+    if data.location:
+        params["location"] = f"eq.{data.location}"
+
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/app_user_feedback_reports",
+        headers=supabase_headers(authorization),
+        params=params,
+        timeout=10
+    )
+
+    if r.status_code != 200:
+        # If Supabase hates it, print the exact reason to the terminal!
+        print(" SUPABASE ERROR ON LIST:", r.text) 
+        raise HTTPException(status_code=500, detail=f"List failed: {r.text}")
+
+    return {"reports": r.json()}
+
+
+# Insert Feedback to Database
+@app.post("/api/feedback/save")
+def create_incident_feedback(data: FeedbackIn, authorization: str | None = Header(default=None)):
+    user = require_user(authorization)
+
+    body = {
+        "user_id": data.user_id or user["id"],
+        "location": data.location,
+        "condition_type": data.condition_type,
+        "severity": data.severity,
+        "comment": data.comment,
+        "latitude": data.lat,
+        "longitude": data.lon,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    r = requests.post(
+        f"{SUPABASE_URL}/rest/v1/app_user_feedback_reports",
+        headers=supabase_headers(authorization),
+        json=body,
+        timeout=10
+    )
+
+    if r.status_code not in (200, 201):
+        # If Supabase hates it, print the exact reason to the terminal!
+        print(" SUPABASE ERROR ON SAVE:", r.text) 
+        raise HTTPException(status_code=500, detail=f"Save failed: {r.text}")
+
+    return {"ok": True}
 
 # If unable to access LTA API for some reason
 def load_placeholder_incidents(num_incidents: int, reason: str):
