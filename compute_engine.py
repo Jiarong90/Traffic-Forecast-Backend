@@ -746,12 +746,20 @@ def recalculate_route(payload):
 
 
     road_meta = payload.get("road_meta") or {}
+    print("B1: before build_graph_recalc", flush=True)
+
     nodes = build_graph_recalc(roads, road_meta)
+    print("B2: after build_graph_recalc nodes:", len(nodes), flush=True)
+
+
+
     if not nodes:
         return {"routes": []}
 
     start_key = nearest_node(nodes, start_lat, start_lon)
     end_key = nearest_node(nodes, end_lat, end_lon)
+    print("B3: after nearest_node", start_key, end_key, flush=True)
+
     if not start_key or not end_key:
         return {"routes": []}
 
@@ -815,7 +823,10 @@ def recalculate_route(payload):
                 return base + intersection_cost * 1.8 + reuse_penalty
             return base + intersection_cost * 0.9 + reuse_penalty
 
+        print("B4: before a_star", flush=True)
+
         path_keys = a_star(nodes, start_key, end_key, cost_fn)
+        print("B5: after a_star path len:", len(path_keys), flush=True)
         if len(path_keys) < 2:
             continue
 
@@ -926,7 +937,7 @@ def build_graph_recalc(roads, road_meta):
             mid_lat = (a_lat + b_lat) / 2.0
             mid_lon = (a_lon + b_lon) / 2.0
 
-            edge_link_id = find_link_id_from_meta(mid_lat, mid_lon, road_meta)
+            edge_link_id = None
 
             if oneway in ("yes", "1", "true"):
                 n1["edges"].append({"to": n2["key"], "weight": base_hours, "link_id": edge_link_id})

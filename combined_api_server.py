@@ -164,6 +164,22 @@ def load_hotspots_lookup():
         print(f"Routing lookup failed: {e}")
         return {}
     
+def load_all_landmarks():
+    master_list = []
+    # Stick to the files you just generated
+    files = ["data/vms_landmarks.parquet", "data/traffic_landmarks.parquet"]
+    
+    for f in files:
+        try:
+            if os.path.exists(f):
+                df = pd.read_parquet(f)
+                master_list.extend(df.to_dict(orient="records"))
+                del df
+        except Exception as e:
+            print(f"Error loading {f}: {e}")
+            
+    gc.collect()
+    return master_list
 
 # Global Data / Load Models
 # Store the precomputed T+15 speedbands for all 150k links
@@ -181,6 +197,8 @@ hotspots_cache = load_hotspots_cache()
 map_hotspots_cache = load_map_hotspots_cache()
 upstream_map = load_upstream_map()
 link_danger_lookup = load_hotspots_lookup()
+xpressways_landmarks = load_all_landmarks()
+print(f"DEBUG: Total landmarks loaded into memory: {len(xpressways_landmarks)}")
 
 road_meta_dict = road_links_df.set_index("link_id")[
     ["start_lat", "start_lon", "end_lat", "end_lon", "mid_lat", "mid_lon", "road_name", "road_category"]
@@ -323,7 +341,7 @@ class FeedbackIn(BaseModel):
     comment: Optional[str] = None
     lat: Optional[float] = None
     lon: Optional[float] = None
-    user_id: Optional[str] = None  # Injected by Node.js server.js
+    user_id: Optional[str] = None  
 
 class FeedbackRequest(BaseModel):
     payload: FeedbackIn
@@ -653,7 +671,7 @@ def find_nearest_link_id(inc_lat, inc_lon, message=""):
     best = top[0]
     return best[1], (best[2] or "LTA Road")
 
-def assemble_features(link_id, active_incidents):
+def assemble_features(link_id, rain_mm, active_incidents):
 
     # Get history and immediately apply the padding fix
     vals = live_speedbands.get(link_id, [6, 6, 6, 6]) 
@@ -680,7 +698,6 @@ def assemble_features(link_id, active_incidents):
     has_breakdown = 0
     start_times = []
 
-    rain_mm = get_link_rainfall(link_id)
     
     # Loop through nearby links to find incidents and their types
     for l in nearby_links:
@@ -1231,7 +1248,7 @@ def delete_saved_place(
 # For feedback in Incident Panel
 @app.post("/api/feedback/list")
 def get_incident_feedback(data: FeedbackIn, authorization: str | None = Header(default=None)):
-    user = require_user(authorization) # Ensure we are authenticated!
+    user = require_user(authorization)
 
     params = {
         "select": "*",
@@ -1249,7 +1266,6 @@ def get_incident_feedback(data: FeedbackIn, authorization: str | None = Header(d
     )
 
     if r.status_code != 200:
-        # If Supabase hates it, print the exact reason to the terminal!
         print(" SUPABASE ERROR ON LIST:", r.text) 
         raise HTTPException(status_code=500, detail=f"List failed: {r.text}")
 
@@ -1872,6 +1888,37 @@ def analyze_habit_route(payload: dict[str, Any],
         # Get all link_ids 
         links = match_info["matched_links"]
 
+        # Get landmarks if available, for expressways
+        EXPRESSWAY_CODES = ["PIE", "AYE", "CTE", "TPE", "SLE", "KPE", "BKE", "ECP", "MCE", "KJE"]
+
+        for link in links:
+            road_name = link.get("road_name", "").upper()
+            
+            matched_code = next((code for code in EXPRESSWAY_CODES if code in road_name), None)
+            
+            if matched_code:
+                best_lm = None
+                min_dist = 400
+                
+                # Filter landmarks to only those on this specific expressway
+                relevant_lms = [lm for lm in xpressways_landmarks if lm.get('road_code') == matched_code]
+                
+                for lm in relevant_lms:
+                    d = approx_meters(link['start_lat'], link['start_lon'], lm['lat'], lm['lon'])
+                    if d < min_dist:
+                        min_dist = d
+                        best_lm = lm['landmark_name']
+                        break
+                
+            
+                if best_lm:
+                    link["display_name"] = f"{matched_code} ({best_lm})"
+                else:
+                    link["display_name"] = matched_code 
+            else:
+                # Normal road, keep original name
+                link["display_name"] = link.get("road_name")
+
         # Use median speed of each speedband for ETA calculation
         BAND_TO_KMH = {
             1: 7,
@@ -2363,7 +2410,7 @@ def get_expressway_geometry(code: str):
         "CTE": "CENTRAL EXPRESSWAY",
         "TPE": "TAMPINES EXPRESSWAY",
         "SLE": "SELETAR EXPRESSWAY",
-        "KPE": "KALLANG-PAYA LEBAR EXPRESSWAY",
+        "KPE": "KALLANG.*PAYA LEBAR",
         "BKE": "BUKIT TIMAH EXPRESSWAY",
         "ECP": "EAST COAST PARKWAY",
         "MCE": "MARINA COASTAL",
@@ -2379,6 +2426,39 @@ def get_expressway_geometry(code: str):
 
     if df_filtered.empty:
         return {"code": code.upper(), "full_name": full_name, "segments": [], "sectors": []}
+    
+
+    # Find landmarks
+    relevant_landmarks = []
+    seen_labels = set()
+    occupied_slots = set() 
+
+    for landmark in xpressways_landmarks:
+        label = landmark["landmark_name"]
+        
+        # Name Check
+        if label in seen_labels: continue
+
+        # This prevents labels from stacking on top of each other
+        slot = (round(landmark['lat'], 2), round(landmark['lon'], 2))
+        if slot in occupied_slots: continue
+
+        vms_lat, vms_lon = float(landmark['lat']), float(landmark['lon'])
+        is_near = False
+        
+        for _, row in df_filtered.iterrows():
+            if approx_meters(vms_lat, vms_lon, row["mid_lat"], row["mid_lon"]) < 300: 
+                is_near = True
+                break
+        
+        if is_near:
+            relevant_landmarks.append({
+                "lat": vms_lat,
+                "lon": vms_lon,
+                "label": label
+            })
+            seen_labels.add(label)
+            occupied_slots.add(slot) 
 
     lon_min, lon_max = df_filtered["mid_lon"].min(), df_filtered["mid_lon"].max()
     lat_min, lat_max = df_filtered["mid_lat"].min(), df_filtered["mid_lat"].max()
@@ -2428,7 +2508,8 @@ def get_expressway_geometry(code: str):
         "code": code.upper(),
         "full_name": full_name,
         "sectors": [{"name": n, "avg_speed": sector_avg.get(n)} for n in names],
-        "segments": segments
+        "segments": segments,
+        "landmarks": relevant_landmarks
     }
 
 
@@ -2518,7 +2599,9 @@ def fetch_roads_from_overpass(s, w, n, e):
 
 STRICT_HIGHWAYS = {
     'motorway', 'trunk', 'primary', 'secondary', 'tertiary',
-    'motorway_link', 'trunk_link', 'primary_link', 'secondary_link', 'tertiary_link'
+    'unclassified',
+    'motorway_link', 'trunk_link', 'primary_link',
+    'secondary_link', 'tertiary_link'
 }
 
 @app.post("/api/recalculate")
@@ -2529,7 +2612,7 @@ async def handle_recalculate(request: RerouteRequest):
 
         start = payload["start"]
         end = payload["end"]
-        padding = 0.003
+        padding = 0.006
         s = min(start["lat"], end["lat"]) - padding
         n = max(start["lat"], end["lat"]) + padding
         w = min(start["lon"], end["lon"]) - padding
@@ -2543,7 +2626,7 @@ async def handle_recalculate(request: RerouteRequest):
         }
         payload["road_meta"] = local_meta
 
-        roads_json = subset_roads_by_bbox(LOCAL_ROADS_JSON, s, w, n, e, margin_deg=0.001)
+        roads_json = subset_roads_by_bbox(LOCAL_ROADS_JSON, s, w, n, e, margin_deg=0.003)
         print("Local subset elements:" ,len(roads_json.get("elements", [])), flush=True)
 
         if "elements" in roads_json and len(roads_json["elements"]) > 0:
@@ -2711,6 +2794,10 @@ def get_map_hotspots():
         "status": "success",
         "data": map_hotspots_cache
     }
+
+@app.get("/api/vms-landmarks")
+async def get_vms_landmarks():
+    return xpressways_landmarks
 
 # Muhsin incident clearance part
 def _load_incident_models():
